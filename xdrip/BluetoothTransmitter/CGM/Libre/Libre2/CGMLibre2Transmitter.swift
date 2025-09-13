@@ -5,7 +5,8 @@ import CoreBluetooth
 #if canImport(CoreNFC)
 import CoreNFC
 
-class CGMLibre2Transmitter:BluetoothTransmitter, CGMTransmitter {
+@objcMembers
+class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
     
     // MARK: - properties
     
@@ -119,15 +120,21 @@ class CGMLibre2Transmitter:BluetoothTransmitter, CGMTransmitter {
             // startScanning is getting called several times, but we must restrict launch of nfc scan to one single time, therefore check if libreNFC == nil
             if libreNFC == nil {
                 
-                libreNFC = LibreNFC(libreNFCDelegate: self)
-                
-                (libreNFC as! LibreNFC).startSession()
+                // NFC session creation must be on main thread
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    self.libreNFC = LibreNFC(libreNFCDelegate: self)
+                    (self.libreNFC as! LibreNFC).startSession()
+                }
                 
             }
             
         } else {
             
-            bluetoothTransmitterDelegate?.error(message: TextsLibreNFC.deviceMustSupportNFC)
+            // delegate may touch UI/Core Data → ensure main thread
+            DispatchQueue.main.async { [weak self] in
+                self?.bluetoothTransmitterDelegate?.error(message: TextsLibreNFC.deviceMustSupportNFC)
+            }
             
         }
         
@@ -143,7 +150,10 @@ class CGMLibre2Transmitter:BluetoothTransmitter, CGMTransmitter {
         if let sensorSerialNumber = tempSensorSerialNumber {
             
             // we need to send the sensorSerialNumber here. Possibly this is a new transmitter being scanned for, in which case the call to cGMLibre2TransmitterDelegate?.received(sensorSerialNumber: ..) in NFCTagReaderSessionDelegate functions wouldn't have stored the status in coredata, because it' doesn't find the transmitter, so let's store it again, at each connect, if not nil
-            cGMLibre2TransmitterDelegate?.received(serialNumber: sensorSerialNumber.serialNumber, from: self)
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.cGMLibre2TransmitterDelegate?.received(serialNumber: sensorSerialNumber.serialNumber, from: self)
+            }
             
             // set to nil so we don't send it again to the delegate when there's a new connect
             tempSensorSerialNumber = nil
@@ -153,12 +163,16 @@ class CGMLibre2Transmitter:BluetoothTransmitter, CGMTransmitter {
             // compare only the last 10 characters. Normally it should be 10, but for some reason, xDrip4iOS does not correctly decode the sensor uid, the first character is not correct
             if let deviceName = deviceName, sensorSerialNumber.serialNumber.suffix(9).uppercased() != deviceName.suffix(9) {
                 
-                bluetoothTransmitterDelegate?.error(message: TextsLibreNFC.connectedLibre2DoesNotMatchScannedLibre2)
+                DispatchQueue.main.async { [weak self] in
+                    self?.bluetoothTransmitterDelegate?.error(message: TextsLibreNFC.connectedLibre2DoesNotMatchScannedLibre2)
+                }
                 
             } else {
 
                 // user should be informed not to scan with the Libre app
-                bluetoothTransmitterDelegate?.error(message: TextsLibreNFC.donotusethelibrelinkapp)
+                DispatchQueue.main.async { [weak self] in
+                    self?.bluetoothTransmitterDelegate?.error(message: TextsLibreNFC.donotusethelibrelinkapp)
+                }
 
             }
             
@@ -241,6 +255,29 @@ class CGMLibre2Transmitter:BluetoothTransmitter, CGMTransmitter {
         
     }
     
+    override func prepareForRelease() {
+        // Clear base CB delegates + unsubscribe common receiveCharacteristic synchronously on main
+        super.prepareForRelease()
+        // Libre2-specific transient state cleanup
+        let tearDown = {
+            self.rxBuffer = Data()
+            self.startDate = Date()
+            self.tempSensorSerialNumber = nil
+            self.libreNFC = nil
+            self.libreSensorType = nil
+        }
+        if Thread.isMainThread {
+            tearDown()
+        } else {
+            DispatchQueue.main.sync(execute: tearDown)
+        }
+    }
+
+    deinit {
+        // Defensive: clear transient buffers
+        rxBuffer = Data()
+    }
+
     // MARK: - helpers
     
     /// reset rxBuffer, reset startDate, stop packetRxMonitorTimer, set resendPacketCounter to 0
@@ -287,13 +324,15 @@ class CGMLibre2Transmitter:BluetoothTransmitter, CGMTransmitter {
                 
                 // decrypt buffer and parse
                 // if oop web not enabled, then don't pass libre1DerivedAlgorithmParameters
-                var parsedBLEData = Libre2BLEUtilities.parseBLEData(Data(try Libre2BLEUtilities.decryptBLE(sensorUID: sensorUID, data: rxBuffer)), libre1DerivedAlgorithmParameters: isWebOOPEnabled() ? UserDefaults.standard.libre1DerivedAlgorithmParameters : nil)
+                let parsedBLEData = Libre2BLEUtilities.parseBLEData(Data(try Libre2BLEUtilities.decryptBLE(sensorUID: sensorUID, data: rxBuffer)), libre1DerivedAlgorithmParameters: isWebOOPEnabled() ? UserDefaults.standard.libre1DerivedAlgorithmParameters : nil)
                 
-                // send glucoseData and sensorAge to cgmTransmitterDelegate
-                cgmTransmitterDelegate?.cgmTransmitterInfoReceived(glucoseData: &parsedBLEData.bleGlucose, transmitterBatteryInfo: nil, sensorAge: TimeInterval(minutes: Double(parsedBLEData.sensorTimeInMinutes)))
-                
-                // send sensorAge also to cGMLibre2TransmitterDelegate
-                cGMLibre2TransmitterDelegate?.received(sensorTimeInMinutes: Int(parsedBLEData.sensorTimeInMinutes), from: self)
+                // deliver glucose data and sensor age to delegates on main; use local copy for inout
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    var copy = parsedBLEData.bleGlucose
+                    self.cgmTransmitterDelegate?.cgmTransmitterInfoReceived(glucoseData: &copy, transmitterBatteryInfo: nil, sensorAge: TimeInterval(minutes: Double(parsedBLEData.sensorTimeInMinutes)))
+                    self.cGMLibre2TransmitterDelegate?.received(sensorTimeInMinutes: Int(parsedBLEData.sensorTimeInMinutes), from: self)
+                }
                 
                 // TODO: add sensor start date -> userdefaults
                 
@@ -361,7 +400,8 @@ class CGMLibre2Transmitter:BluetoothTransmitter, CGMTransmitter {
 
 #else
 
-class CGMLibre2Transmitter:BluetoothTransmitter, CGMTransmitter {
+@objcMembers
+class CGMLibre2Transmitter: BluetoothTransmitter, CGMTransmitter {
     
 }
 
@@ -391,7 +431,6 @@ extension CGMLibre2Transmitter: LibreNFCDelegate {
                 
                 
             }
-            
         }
         
     }
@@ -420,9 +459,11 @@ extension CGMLibre2Transmitter: LibreNFCDelegate {
                 self.sensorSerialNumber = receivedSensorSerialNumberAsString
                 
                 // assign sensorStartDate, for this type of transmitter the sensorAge is passed in another call to cgmTransmitterDelegate
-                cgmTransmitterDelegate?.newSensorDetected(sensorStartDate: nil)
-
-                cGMLibre2TransmitterDelegate?.received(serialNumber: receivedSensorSerialNumberAsString, from: self)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    self.cgmTransmitterDelegate?.newSensorDetected(sensorStartDate: nil)
+                    self.cGMLibre2TransmitterDelegate?.received(serialNumber: receivedSensorSerialNumberAsString, from: self)
+                }
 
             }
             

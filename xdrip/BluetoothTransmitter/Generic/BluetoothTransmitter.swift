@@ -14,6 +14,8 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     public weak var bluetoothTransmitterDelegate: BluetoothTransmitterDelegate?
 
     // MARK: - private properties
+    /// whether we should auto‑reconnect after a disconnect callback
+    private var autoReconnectEnabled = true
     
     /// the address of the transmitter. If nil then transmitter never connected, so we don't know the address.
     private(set) var deviceAddress:String?
@@ -35,6 +37,24 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     
     // for trace,
     private let log = OSLog(subsystem: ConstantsLog.subSystem, category: ConstantsLog.categoryBlueToothTransmitter)
+
+    /// central queue for all CoreBluetooth work (dedicated serial queue)
+    private let centralQueue = DispatchQueue(label: "bt.central", qos: .userInitiated)
+
+    /// assert helper to ensure code is running on centralQueue (debug-only)
+    private func assertOnCentral(function: String = #function) {
+        // Using dispatchPrecondition is safe and low-overhead. This is for development safety only.
+        dispatchPrecondition(condition: .onQueue(centralQueue))
+    }
+
+    /// helper to hand off work to main thread (UI / Core Data)
+    private func dispatchToMain(_ block: @escaping () -> Void) {
+        if Thread.isMainThread {
+            block()
+        } else {
+            DispatchQueue.main.async(execute: block)
+        }
+    }
 
     /// centralManager
     private var centralManager: CBCentralManager?
@@ -60,6 +80,10 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     
     /// when trying to connect to a discovered device for the first time, a timer will be used to avoid that connection attempts take forever
     private var connectTimeOutTimer: Timer?
+
+    /// De-dup state for connection log spam
+    private var lastConnectLogAt: Date = .distantPast
+    private var lastConnectLogName: String? = nil
     
     // MARK: - Initialization
     
@@ -107,21 +131,43 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     // MARK: - De-initialization
     
     deinit {
-        
-        // disconnect the device
-        disconnect()
-        
+        // Clear CoreBluetooth delegates synchronously on main as last resort
+        let clear = {
+            self.centralManager?.delegate = nil
+            self.peripheral?.delegate = nil
+        }
+        if Thread.isMainThread {
+            clear()
+        } else {
+            DispatchQueue.main.sync(execute: clear)
+        }
     }
     
     // MARK: - public functions
+
+    /// Hook for subclasses to clear CoreBluetooth delegates/timers before ARC release.
+    /// Default clears CoreBluetooth delegates on the main thread synchronously to avoid races with CB callbacks.
+    @objc func prepareForRelease() {
+        let clear = {
+            self.centralManager?.delegate = nil
+            self.peripheral?.delegate = nil
+        }
+        if Thread.isMainThread {
+            clear()
+        } else {
+            DispatchQueue.main.sync(execute: clear)
+        }
+    }
     
     /// will try to connect to the device, first by calling retrievePeripherals, if peripheral not known, then by calling startScanning
     func connect() {
-        
-        if let centralManager = centralManager, !retrievePeripherals(centralManager) {
-            _ = startScanning()
+        centralQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.autoReconnectEnabled = true
+            if let centralManager = self.centralManager, !self.retrievePeripherals(centralManager) {
+                _ = self.startScanning()
+            }
         }
-
     }
     
     /// gets peripheral connection status, nil if peripheral not existing yet
@@ -131,32 +177,43 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     
     /// disconnect the device
     func disconnect() {
-        
-        if let peripheral = peripheral {
-            if let centralManager = centralManager {
-                trace("in disconnect, disconnecting, for peripheral with name %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info, deviceName ?? "'unknown'")
-                centralManager.cancelPeripheralConnection(peripheral)
+        centralQueue.async { [weak self] in
+            guard let self = self else { return }
+            // Manual disconnects should not auto‑reconnect
+            self.autoReconnectEnabled = false
+            // Clear delegates synchronously on main to avoid Obj‑C weak ref issues
+            self.prepareForRelease()
+            if let peripheral = self.peripheral {
+                if let rc = self.receiveCharacteristic {
+                    peripheral.setNotifyValue(false, for: rc)
+                }
+                if let centralManager = self.centralManager {
+                    trace("in disconnect, disconnecting, for peripheral with name %{public}@", log: self.log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info, self.deviceName ?? "'unknown'")
+                    centralManager.cancelPeripheralConnection(peripheral)
+                }
             }
         }
-      
     }
     
     /// in case a new device is being scanned for, and we connected (because name matched) but later we want to forget that device, then call this function
     func disconnectAndForget() {
-        
+        // do not auto‑reconnect after a user‑initiated forget
+        autoReconnectEnabled = false
+        // clear delegates before requesting disconnect
+        prepareForRelease()
         // force disconnect
         disconnect()
-
-        // set to nil
+        // clear local references
         peripheral = nil
         deviceName = nil
         deviceAddress = nil
-        
     }
     
     /// stops scanning
     func stopScanning() {
-        self.centralManager?.stopScan()
+        centralQueue.async { [weak self] in
+            self?.centralManager?.stopScan()
+        }
     }
     
     /// is the transmitter currently scanning or not
@@ -169,6 +226,7 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     
     /// start bluetooth scanning for device
     func startScanning() -> BluetoothTransmitter.startScanningResult {
+        // NOTE: This method is expected to run on bt.central. It is invoked from centralQueue in connect().
         
         trace("in startScanning", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info)
         
@@ -246,7 +304,10 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     func writeDataToPeripheral(data:Data, type:CBCharacteristicWriteType)  -> Bool {
         if let peripheral = peripheral, let writeCharacteristic = writeCharacteristic, getConnectionStatus() == CBPeripheralState.connected {
             trace("in writeDataToPeripheral, for peripheral with name %{public}@, characteristic = %{public}@, data = %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info, deviceName ?? "'unknown'", writeCharacteristic.uuid.uuidString, data.hexEncodedString())
-            peripheral.writeValue(data, for: writeCharacteristic, type: type)
+            
+            centralQueue.async {
+                peripheral.writeValue(data, for: writeCharacteristic, type: type)
+            }
             return true
         } else {
             trace("in writeDataToPeripheral, for peripheral with name %{public}@, failed because either peripheral or writeCharacteristic is nil or not connected", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .error, deviceName ?? "'unknown'")
@@ -256,7 +317,9 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     
     /// calls peripheral?.readValue(for: characteristic)
     func readValueForCharacteristic(for characteristic: CBCharacteristic) {
-        peripheral?.readValue(for: characteristic)
+        centralQueue.async { [weak self] in
+            self?.peripheral?.readValue(for: characteristic)
+        }
     }
 
     /// will write to characteristicToWriteTo
@@ -267,7 +330,9 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
             
             trace("in writeDataToPeripheral, for peripheral with name %{public}@, for characteristic %{public}@, data = %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info, deviceName ?? "'unknown'", characteristicToWriteTo.uuid.description, data.hexEncodedString())
             
-            peripheral.writeValue(data, for: characteristicToWriteTo, type: type)
+            centralQueue.async {
+                peripheral.writeValue(data, for: characteristicToWriteTo, type: type)
+            }
             
             return true
             
@@ -283,8 +348,10 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     /// calls setNotifyValue for characteristic with value enabled
     func setNotifyValue(_ enabled: Bool, for characteristic: CBCharacteristic) {
         if let peripheral = peripheral {
-            trace("setNotifyValue, for peripheral with name %{public}@, setting notify for characteristic %{public}@, to %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info, deviceName ?? "'unknown'", characteristic.uuid.uuidString, enabled.description)
-          peripheral.setNotifyValue(enabled, for: characteristic)
+
+            centralQueue.async {
+                peripheral.setNotifyValue(enabled, for: characteristic)
+            }
         } else {
             trace("setNotifyValue, for peripheral with name %{public}@, failed to set notify for characteristic %{public}@, to %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .error, deviceName ?? "'unknown'", characteristic.uuid.uuidString, enabled.description)
         }
@@ -314,7 +381,10 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
             trace("    trying to connect", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info)
             
             // set timer to avoid that connection attempt takes forever
-            connectTimeOutTimer = Timer.scheduledTimer(timeInterval: 5.0, target: self, selector: #selector(stopConnectAndRestartScanning), userInfo: nil, repeats: false)
+            // schedule timer on main thread because background queues do not have a run loop
+            DispatchQueue.main.async { [weak self] in
+                self?.connectTimeOutTimer = Timer.scheduledTimer(timeInterval: 5.0, target: self as Any, selector: #selector(BluetoothTransmitter.stopConnectAndRestartScanning), userInfo: nil, repeats: false)
+            }
             
             centralManager?.connect(peripheral, options: nil)
             
@@ -424,9 +494,19 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         
         timeStampLastStatusUpdate = Date()
         
-        trace("connected to peripheral with name %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info, deviceName ?? "'unknown'")
+        let now = Date()
+        let name = deviceName ?? "'unknown'"
+        if now.timeIntervalSince(lastConnectLogAt) > 2.0 || lastConnectLogName != name {
+            trace("connected to peripheral with name %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info, name)
+            lastConnectLogAt = now
+            lastConnectLogName = name
+        }
         
-        bluetoothTransmitterDelegate?.didConnectTo(bluetoothTransmitter: self)
+        // delegate can update UI / Core Data. Ensure main thread
+        dispatchToMain { [weak self] in
+            guard let self = self else { return }
+            self.bluetoothTransmitterDelegate?.didConnectTo(bluetoothTransmitter: self)
+        }
 
         peripheral.discoverServices(servicesCBUUIDs)
         
@@ -452,7 +532,11 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         
         trace("in centralManagerDidUpdateState, for peripheral with name %{public}@, new state is %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info, deviceName ?? "'unknown'", "\(central.state.toString())")
         
-        bluetoothTransmitterDelegate?.deviceDidUpdateBluetoothState(state: central.state, bluetoothTransmitter: self)
+        // delegate can update UI / Core Dat. Ensure main thread
+        dispatchToMain { [weak self] in
+            guard let self = self else { return }
+            self.bluetoothTransmitterDelegate?.deviceDidUpdateBluetoothState(state: central.state, bluetoothTransmitter: self)
+        }
 
         /// in case status changed to powered on and if device address known then try  to retrieveperipherals
         if central.state == .poweredOn {
@@ -470,21 +554,37 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         
         timeStampLastStatusUpdate = Date()
         
-        trace("    didDisconnect peripheral with name %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info , deviceName ?? "'unknown'")
-        
-        bluetoothTransmitterDelegate?.didDisconnectFrom(bluetoothTransmitter: self)
-
-        if let error = error {
-            trace("    error: %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .error , error.localizedDescription)
+        // delegate can update UI / Core Data. Ensure main thread
+        dispatchToMain { [weak self] in
+            guard let self = self else { return }
+            self.bluetoothTransmitterDelegate?.didDisconnectFrom(bluetoothTransmitter: self)
         }
+
+        // Replace your current disconnect logging block with this:
+        if let err = error {
+            if let cbErr = err as? CBError, cbErr.code == .peripheralDisconnected {
+                // Expected short-lived disconnect (normal Dexcom behavior)
+                trace("    didDisconnect peripheral with name %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info, deviceName ?? "'unknown'")
+            } else {
+                // Unexpected error
+                trace("    didDisconnect peripheral %{public}@ with error: %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .error, deviceName ?? "'unknown'", err.localizedDescription)
+            }
+        } else {
+            // Clean disconnect (rare, but handle)
+            trace("    didDisconnect peripheral with name %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info, deviceName ?? "'unknown'")
+        }
+
+        // Keep noisy reconnect intent at debug
+        trace("    Will try to reconnect", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .debug)
+        
         
         // if self.peripheral == nil, then a manual disconnect or something like that has occured, no need to reconnect
         // otherwise disconnect occurred because of other (like out of range), so let's try to reconnect
-        if let ownPeripheral = self.peripheral {
-            trace("    Will try to reconnect", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info)
+        if autoReconnectEnabled, let ownPeripheral = self.peripheral {
+            trace("    Will try to reconnect", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .debug)
             centralManager?.connect(ownPeripheral, options: nil)
         } else {
-            trace("    peripheral is nil, will not try to reconnect", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info)
+            trace("    autoReconnect disabled or peripheral is nil, will not try to reconnect", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info)
         }
 
     }
@@ -493,7 +593,7 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         
         timeStampLastStatusUpdate = Date()
         
-        trace("didDiscoverServices for peripheral with name %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info, deviceName ?? "'unknown'")
+        trace("didDiscoverServices for peripheral with name %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .debug, deviceName ?? "'unknown'")
         
         if let error = error {
             trace("    didDiscoverServices error: %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .error ,  "\(error.localizedDescription)")
@@ -501,7 +601,7 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         
         if let services = peripheral.services {
             for service in services {
-                trace("    Call discovercharacteristics for service with uuid %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info, String(describing: service.uuid))
+                trace("    Call discovercharacteristics for service with uuid %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .debug, String(describing: service.uuid))
                 peripheral.discoverCharacteristics(nil, for: service)
             }
         } else {
@@ -513,7 +613,7 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         
         timeStampLastStatusUpdate = Date()
         
-        trace("didDiscoverCharacteristicsFor for peripheral with name %{public}@, for service with uuid %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info, deviceName ?? "'unknown'", String(describing:service.uuid))
+        trace("didDiscoverCharacteristicsFor for peripheral with name %{public}@, for service with uuid %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .debug, deviceName ?? "'unknown'", String(describing:service.uuid))
         
         if let error = error {
             trace("    didDiscoverCharacteristicsFor error: %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .error , error.localizedDescription)
@@ -521,15 +621,15 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         
         if let characteristics = service.characteristics {
             for characteristic in characteristics {
-                trace("    characteristic: %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info, String(describing: characteristic.uuid))
+                trace("    characteristic: %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .debug, String(describing: characteristic.uuid))
                 if (characteristic.uuid == CBUUID(string: CBUUID_WriteCharacteristic)) {
-                    trace("    found writeCharacteristic", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info)
+                    trace("    found writeCharacteristic", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .debug)
                     writeCharacteristic = characteristic
                 } //don't use else because some devices have only one characteristic uuid for both transmit and receive
                 if characteristic.uuid == CBUUID(string: CBUUID_ReceiveCharacteristic) {
-                    trace("    found receiveCharacteristic", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info)
+                    trace("    found receiveCharacteristic", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .debug)
                     receiveCharacteristic = characteristic
-                    peripheral.setNotifyValue(true, for: characteristic)
+                    setNotifyValue(true, for: characteristic)
                 }
             }
         } else {
@@ -562,7 +662,7 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
 
         // trace the received value
         if let value = characteristic.value {
-            trace("in peripheralDidUpdateValueFor, data = %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info, value.hexEncodedString())
+            trace("in peripheralDidUpdateValueFor, data = %{public}@", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .debug, value.hexEncodedString())
         }
         
         timeStampLastStatusUpdate = Date()
@@ -575,13 +675,36 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
     
     func centralManager(_ central: CBCentralManager,
                         willRestoreState dict: [String : Any]) {
-
-        // willRestoreState must be defined, otherwise the app would crash (because the centralManager was created with a CBCentralManagerOptionRestoreIdentifierKey)
-        // even if it's an empty function
-        // trace is called here because it allows us to see in the issue reports if there was a restart after app crash or removed from memory - in all other cases (force closed by user) this function is not called
-
         trace("in willRestoreState", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info)
-        
+
+        // Attempt to reuse the restored peripheral (if any) without forcing a rescan.
+        if let restoredPeripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral],
+           let restored = restoredPeripherals.first {
+
+            // Re-attach references and delegates
+            self.peripheral = restored
+            self.deviceAddress = restored.identifier.uuidString
+            self.deviceName = restored.name
+            restored.delegate = self
+
+            trace("    willRestoreState: restored peripheral %{public}@ (state=%{public}@)", log: log, category: ConstantsLog.categoryBlueToothTransmitter, type: .info, restored.name ?? "'unknown'", restored.state.description())
+
+            switch restored.state {
+            case .connected:
+                // If receiveCharacteristic is already cached, ensure notifications are enabled; otherwise re-discover services
+                if let rc = self.receiveCharacteristic {
+                    setNotifyValue(true, for: rc)
+                } else {
+                    restored.discoverServices(self.servicesCBUUIDs)
+                }
+            case .connecting:
+                // Nothing to do; CoreBluetooth will finish the connection
+                break
+            default:
+                // Ask CoreBluetooth to reconnect to the restored device to minimize races with scanning
+                central.connect(restored, options: nil)
+            }
+        }
     }
 
     // MARK: - helpers
@@ -627,7 +750,8 @@ class BluetoothTransmitter: NSObject, CBCentralManagerDelegate, CBPeripheralDele
         }
         
         
-        centralManager = CBCentralManager(delegate: self, queue: nil, options: [CBCentralManagerOptionShowPowerAlertKey: true, CBCentralManagerOptionRestoreIdentifierKey: cBCentralManagerOptionRestoreIdentifierKeyToUse!])
+        // Create central manager on dedicated bt.central queue so all delegate callbacks arrive off the main thread
+        centralManager = CBCentralManager(delegate: self, queue: centralQueue, options: [CBCentralManagerOptionShowPowerAlertKey: true, CBCentralManagerOptionRestoreIdentifierKey: cBCentralManagerOptionRestoreIdentifierKeyToUse!])
         
     }
     
