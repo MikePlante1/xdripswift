@@ -70,18 +70,21 @@ final class TransmitterReadSuccessManager {
         // Infer nominal gap from 24h
         let nominalGapInSeconds = TransmitterReadSuccessManager.inferNominalGapSeconds(earliest: earliest24h, latest: latest24h, distinctCount: windowCounts.distinctCountLast24h)
 
-        // Helper to compute expected for a given window size (in hours)
+        // Helper to compute expected slots using the actual span between
+        // the effective window start and the timestamp of the latest reading.
+        // This avoids under-counting when the last reading is a few minutes old
+        // and prevents masking isolated gaps as 100% success.
         func expectedSlots(forWindowHours hours: Int) -> Int {
             guard nominalGapInSeconds > 0 else { return 0 }
             guard let earliest24h = earliest24h else { return 0 }
-            
+
             let windowSeconds = Double(hours) * 3600.0
             let fixed = Int(floor(windowSeconds / Double(nominalGapInSeconds)))
-            
+
             let startOfWindow = now.addingTimeInterval(-windowSeconds)
-            
+
             if earliest24h > startOfWindow {
-                // From-first-reading within this window (inclusive end)
+                // From first reading within this window (inclusive end)
                 let span = max(0.0, now.timeIntervalSince(earliest24h))
                 return max(1, Int(floor(span / Double(nominalGapInSeconds))) + 1)
             } else {
@@ -106,9 +109,21 @@ final class TransmitterReadSuccessManager {
         actual12h = expected12h - missing12
         actual24h = expected24h - missing24
 
-        let success6h  = expected6h  > 0 ? (Double(actual6h)  * 100.0) / Double(expected6h)  : 0.0
-        let success12h = expected12h > 0 ? (Double(actual12h) * 100.0) / Double(expected12h) : 0.0
-        let success24h = expected24h > 0 ? (Double(actual24h) * 100.0) / Double(expected24h) : 0.0
+        // Compute display percentages: floor to one decimal place and never show 100% if there are misses
+        func flooredPercent(actual: Int, expected: Int, hasMisses: Bool) -> Double {
+            guard expected > 0 else { return 0.0 }
+            let raw = (Double(actual) * 100.0) / Double(expected)
+            // floor to one decimal place
+            let floored = floor(raw * 10.0) / 10.0
+            if hasMisses {
+                return min(floored, 99.9)
+            }
+            return floored
+        }
+
+        let success6h  = flooredPercent(actual: actual6h,  expected: expected6h,  hasMisses: missing6  > 0)
+        let success12h = flooredPercent(actual: actual12h, expected: expected12h, hasMisses: missing12 > 0)
+        let success24h = flooredPercent(actual: actual24h, expected: expected24h, hasMisses: missing24 > 0)
 
         return TransmitterReadSuccessDisplay(
             nominalGapInSeconds: nominalGapInSeconds,
@@ -153,4 +168,3 @@ final class TransmitterReadSuccessManager {
         return getReadSuccess(forSensor: sensor, now: nowInstant, notBefore: cutoff)
     }
 }
-
